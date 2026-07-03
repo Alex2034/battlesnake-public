@@ -1,0 +1,2 @@
+"""Algorithmic Battlesnake engine."""
+
