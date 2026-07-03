@@ -1,6 +1,9 @@
 import unittest
+from unittest.mock import patch
 
 from battlesnake.evaluation import _wall_pressure
+from battlesnake.ml_features import candidate_features
+from battlesnake.model import score_features
 from battlesnake.parser import from_game_state
 from battlesnake.rules import simulate_turn, survivable_moves
 from battlesnake.search import _limited_product
@@ -68,6 +71,24 @@ class AlgorithmicStrategyTest(unittest.TestCase):
         state = game_state([(1, 5), (1, 4), (1, 3)])
 
         self.assertEqual(choose_move(state), "right")
+
+    def test_ml_model_scores_safe_food_move_higher_when_hungry(self):
+        state = from_game_state(game_state([(5, 5), (5, 4), (5, 3)], food=((6, 5),), health=12))
+
+        scores = {
+            move: score_features(candidate_features(state, state.you, move))
+            for move in survivable_moves(state, state.you)
+        }
+
+        self.assertGreater(scores["right"], scores["up"])
+        self.assertGreater(scores["right"], scores["left"])
+
+    def test_ml_failure_falls_back_to_algorithmic_scoring(self):
+        state = from_game_state(game_state([(1, 5), (1, 4), (1, 3)]))
+
+        with patch("battlesnake.strategy.candidate_features", side_effect=RuntimeError("model boom")):
+            with self.assertLogs("battlesnake.strategy", level="WARNING"):
+                self.assertEqual(choose_move_from_state(state), "right")
 
     def test_own_tail_is_survivable_when_it_moves(self):
         state = from_game_state(

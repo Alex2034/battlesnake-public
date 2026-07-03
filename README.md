@@ -1,7 +1,8 @@
-# Battlesnake Algorithmic Bot
+# Battlesnake Hybrid Bot
 
 A [Battlesnake](https://play.battlesnake.com) written in Python and Flask.
-This version uses a hand-built algorithmic engine instead of an ML checkpoint.
+This version combines a hand-built algorithmic engine with an embedded linear
+ML move-ranking model.
 
 ## What It Does
 
@@ -12,6 +13,7 @@ Each turn, the bot:
 - Builds enemy head-to-head threat maps.
 - Scores space, exits, tail reachability, food urgency, walls, and territory.
 - Runs a small adversarial lookahead over plausible enemy replies.
+- Adds a bounded ML rank bonus for safe candidate moves.
 - Returns the strongest risk-adjusted move.
 
 ## Architecture
@@ -24,6 +26,8 @@ Each turn, the bot:
 - `battlesnake/pathfinding.py` - BFS, flood fill, exits, shortest paths.
 - `battlesnake/danger.py` - enemy threat maps and head-to-head danger.
 - `battlesnake/evaluation.py` - hand-tuned position evaluation.
+- `battlesnake/ml_features.py` - feature extraction for the embedded model.
+- `battlesnake/model.py` - standardized linear move-ranking checkpoint.
 - `battlesnake/search.py` - bounded adversarial lookahead.
 - `battlesnake/strategy.py` - top-level move selection.
 - `tests/` - focused tactical scenario tests.

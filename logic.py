@@ -17,5 +17,5 @@ def get_info() -> Dict[str, str]:
         "color": "#1f8f5f",
         "head": "beluga",
         "tail": "bolt",
-        "version": "1.0.0-algorithmic",
+        "version": "1.1.0-hybrid",
     }
