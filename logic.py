@@ -59,6 +59,10 @@ def choose_move(game_state: Dict) -> str:
     try:
         scored = _score_moves(game_state)
         if scored:
+            attack_move = _find_safe_forced_kill_move(game_state, scored, horizon=3)
+            if attack_move is not None:
+                return attack_move
+
             scored.sort(key=lambda row: row["score"], reverse=True)
             return str(scored[0]["move"])
     except Exception as exc:  # noqa: BLE001 - gameplay must never 500 on /move
@@ -230,6 +234,325 @@ def _last_chance_move(state: Dict) -> str:
 
     return "up"
 
+
+
+# ---------------------------------------------------------------------------
+# Short-horizon attack search
+
+
+def _find_safe_forced_kill_move(state: Dict, scored: Sequence[Dict[str, float]], horizon: int = 3) -> Optional[str]:
+    """Return an aggressive move only when it safely forces a shorter snake to die.
+
+    This is intentionally conservative.  The search only attacks snakes that are
+    strictly shorter than us, because those are the only snakes we can safely
+    beat in a head-to-head collision.  It then checks a small minimax tree:
+
+    * we choose a move;
+    * the target may choose any currently survivable reply;
+    * after observing that reply on the next turn, we may choose again;
+    * if every target line dies within ``horizon`` plies while we stay alive,
+      the first move is considered a forced kill.
+
+    Other enemy snakes are treated as static blockers.  That keeps the search
+    fast and avoids reckless attacks in crowded boards.
+    """
+    board = state.get("board", {})
+    you = state.get("you", {})
+    width, height = int(board.get("width", 11)), int(board.get("height", 11))
+    foods = set(_points(board.get("food", [])))
+    hazards = set(_points(board.get("hazards", [])))
+    hazard_damage = _hazard_damage(state)
+
+    my_id = you.get("id")
+    my_body = _body_points(you)
+    my_length = int(you.get("length", len(my_body)))
+    my_health = int(you.get("health", 100))
+    snakes = board.get("snakes", [])
+
+    if not my_body or my_length < 3:
+        return None
+
+    scored_by_move = {str(row["move"]): row for row in scored}
+    candidate_moves = sorted(scored_by_move, key=lambda m: scored_by_move[m]["score"], reverse=True)
+
+    for move in candidate_moves:
+        row = scored_by_move[move]
+        # Do not sacrifice the survival policy for a speculative tactic.
+        if row.get("safe_space", 0.0) < max(float(my_length + 2), float(my_length) * 1.4):
+            continue
+        if row.get("exits", 0.0) <= 0:
+            continue
+
+        for target in snakes:
+            if target.get("id") == my_id:
+                continue
+            target_body = _body_points(target)
+            target_length = int(target.get("length", len(target_body)))
+            if not target_body or target_length >= my_length:
+                continue
+
+            other_blocked = _static_other_snakes(snakes, {my_id, target.get("id")})
+            if _move_forces_target_death(
+                my_body=my_body,
+                my_health=my_health,
+                target_body=target_body,
+                target_health=int(target.get("health", 100)),
+                first_move=move,
+                depth=horizon,
+                width=width,
+                height=height,
+                foods=foods,
+                hazards=hazards,
+                hazard_damage=hazard_damage,
+                other_blocked=other_blocked,
+            ):
+                print(f"ATTACK: forced kill on {target.get('name') or target.get('id')} via {move}")
+                return move
+
+    return None
+
+
+def _move_forces_target_death(
+    my_body: List[Point],
+    my_health: int,
+    target_body: List[Point],
+    target_health: int,
+    first_move: str,
+    depth: int,
+    width: int,
+    height: int,
+    foods: Set[Point],
+    hazards: Set[Point],
+    hazard_damage: int,
+    other_blocked: Set[Point],
+) -> bool:
+    """Check whether one chosen move wins against every target reply."""
+    my_moves = [first_move]
+    return _exists_killing_strategy(
+        my_body=my_body,
+        my_health=my_health,
+        target_body=target_body,
+        target_health=target_health,
+        depth=depth,
+        width=width,
+        height=height,
+        foods=foods,
+        hazards=hazards,
+        hazard_damage=hazard_damage,
+        other_blocked=other_blocked,
+        forced_my_moves=my_moves,
+    )
+
+
+def _exists_killing_strategy(
+    my_body: List[Point],
+    my_health: int,
+    target_body: List[Point],
+    target_health: int,
+    depth: int,
+    width: int,
+    height: int,
+    foods: Set[Point],
+    hazards: Set[Point],
+    hazard_damage: int,
+    other_blocked: Set[Point],
+    forced_my_moves: Optional[List[str]] = None,
+) -> bool:
+    """Minimax search: exists our move such that all target replies lose."""
+    if depth <= 0:
+        return False
+
+    if forced_my_moves:
+        my_moves = forced_my_moves
+    else:
+        my_moves = _tactical_safe_moves(my_body, target_body, my_health, width, height, foods, hazards, hazard_damage, other_blocked)
+
+    if not my_moves:
+        return False
+
+    for my_move in my_moves:
+        target_replies = _tactical_safe_moves(target_body, my_body, target_health, width, height, foods, hazards, hazard_damage, other_blocked)
+
+        # If the target has no legal reply before this simultaneous turn, the
+        # trap is already complete.
+        if not target_replies:
+            return True
+
+        all_replies_die = True
+        for target_move in target_replies:
+            result = _resolve_two_snake_turn(
+                my_body=my_body,
+                my_health=my_health,
+                my_move=my_move,
+                target_body=target_body,
+                target_health=target_health,
+                target_move=target_move,
+                width=width,
+                height=height,
+                foods=foods,
+                hazards=hazards,
+                hazard_damage=hazard_damage,
+                other_blocked=other_blocked,
+            )
+
+            if result["my_dead"]:
+                all_replies_die = False
+                break
+            if result["target_dead"]:
+                continue
+
+            next_foods = set(foods)
+            if result["my_ate"]:
+                next_foods.discard(result["my_head"])
+            if result["target_ate"]:
+                next_foods.discard(result["target_head"])
+
+            if not _exists_killing_strategy(
+                my_body=result["my_body"],
+                my_health=result["my_health"],
+                target_body=result["target_body"],
+                target_health=result["target_health"],
+                depth=depth - 1,
+                width=width,
+                height=height,
+                foods=next_foods,
+                hazards=hazards,
+                hazard_damage=hazard_damage,
+                other_blocked=other_blocked,
+                forced_my_moves=None,
+            ):
+                all_replies_die = False
+                break
+
+        if all_replies_die:
+            return True
+
+    return False
+
+
+def _tactical_safe_moves(
+    body: List[Point],
+    opponent_body: List[Point],
+    health: int,
+    width: int,
+    height: int,
+    foods: Set[Point],
+    hazards: Set[Point],
+    hazard_damage: int,
+    other_blocked: Set[Point],
+) -> List[str]:
+    """Legal moves for a simplified two-snake tactical search."""
+    if not body:
+        return []
+    head = body[0]
+    own_tail = body[-1]
+    opp_tail = opponent_body[-1] if opponent_body else None
+
+    blocked = set(body) | set(opponent_body) | set(other_blocked)
+    blocked.discard(own_tail)
+    if opp_tail is not None:
+        blocked.discard(opp_tail)
+
+    moves: List[str] = []
+    for move, delta in DIRECTIONS.items():
+        nxt = _add(head, delta)
+        if not _in_bounds(nxt, width, height):
+            continue
+        if nxt in blocked:
+            continue
+        if _lethal_hazard(nxt, foods, hazards, health, hazard_damage):
+            continue
+        moves.append(move)
+    return moves
+
+
+def _resolve_two_snake_turn(
+    my_body: List[Point],
+    my_health: int,
+    my_move: str,
+    target_body: List[Point],
+    target_health: int,
+    target_move: str,
+    width: int,
+    height: int,
+    foods: Set[Point],
+    hazards: Set[Point],
+    hazard_damage: int,
+    other_blocked: Set[Point],
+) -> Dict:
+    """Project one simultaneous turn for our snake and one target snake."""
+    my_head = _add(my_body[0], DIRECTIONS[my_move])
+    target_head = _add(target_body[0], DIRECTIONS[target_move])
+
+    my_ate = my_head in foods
+    target_ate = target_head in foods
+
+    new_my_body = _advance_body(my_body, my_head, my_ate)
+    new_target_body = _advance_body(target_body, target_head, target_ate)
+
+    my_next_health = _next_health(my_health, my_head, my_ate, hazards, hazard_damage)
+    target_next_health = _next_health(target_health, target_head, target_ate, hazards, hazard_damage)
+
+    my_dead = not _in_bounds(my_head, width, height) or my_next_health <= 0
+    target_dead = not _in_bounds(target_head, width, height) or target_next_health <= 0
+
+    if my_head in other_blocked:
+        my_dead = True
+    if target_head in other_blocked:
+        target_dead = True
+
+    if my_head == target_head:
+        if len(new_my_body) > len(new_target_body):
+            target_dead = True
+        elif len(new_my_body) < len(new_target_body):
+            my_dead = True
+        else:
+            my_dead = True
+            target_dead = True
+    else:
+        # Body collisions after tails have moved.
+        if my_head in set(new_my_body[1:]) or my_head in set(new_target_body[1:]):
+            my_dead = True
+        if target_head in set(new_target_body[1:]) or target_head in set(new_my_body[1:]):
+            target_dead = True
+
+    return {
+        "my_dead": my_dead,
+        "target_dead": target_dead,
+        "my_body": new_my_body,
+        "target_body": new_target_body,
+        "my_health": my_next_health,
+        "target_health": target_next_health,
+        "my_ate": my_ate,
+        "target_ate": target_ate,
+        "my_head": my_head,
+        "target_head": target_head,
+    }
+
+
+def _advance_body(body: List[Point], new_head: Point, eating: bool) -> List[Point]:
+    new_body = [new_head] + list(body)
+    if not eating:
+        new_body = new_body[:-1]
+    return new_body
+
+
+def _next_health(health: int, head: Point, eating: bool, hazards: Set[Point], hazard_damage: int) -> int:
+    if eating:
+        return 100
+    next_health = health - 1
+    if head in hazards:
+        next_health -= hazard_damage
+    return next_health
+
+
+def _static_other_snakes(snakes: Sequence[Dict], excluded_ids: Set[str]) -> Set[Point]:
+    blocked: Set[Point] = set()
+    for snake in snakes:
+        if snake.get("id") in excluded_ids:
+            continue
+        blocked.update(_body_points(snake))
+    return blocked
 
 # ---------------------------------------------------------------------------
 # Geometry and board helpers
